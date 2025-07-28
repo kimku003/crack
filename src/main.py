@@ -1,7 +1,9 @@
 
 import flet as ft
 import os
+import sys
 import threading
+from functools import partial
 from flet import (
     TextField,
     Dropdown,
@@ -20,34 +22,13 @@ from flet import (
     alignment,
     FontWeight,
 )
-from apikey_validator import valider_cle_gemini
+from apikey_validator import core, config
 
-class UILogger:
-    def __init__(self, result_log: TextField, progress_bar: ProgressBar, page: ft.Page, status_text: Text):
-        self.result_log = result_log
-        self.progress_bar = progress_bar
-        self.page = page
-        self.buffer = ""
-        self.status_text = status_text
 
-    def write(self, message: str):
-        self.buffer += message
-        if "\n" in self.buffer:
-            self.result_log.value += self.buffer
-            self.buffer = ""
-            self.page.update()
-        
-        last_line = message.strip().split('\n')[-1]
-        if last_line:
-            self.status_text.value = last_line
-            self.page.update()
-
-    def flush(self):
-        pass
 
 def main(page: ft.Page):
 
-    page.title = "Outil de Sécurité pour Clés API"
+    page.title = "API Security Scanner"
     page.window_width = 900
     page.window_height = 700
     page.theme_mode = ft.ThemeMode.DARK
@@ -56,43 +37,64 @@ def main(page: ft.Page):
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(base_dir, 'apikey_validator', 'config.json')
-        valider_cle_gemini.PATTERNS = valider_cle_gemini.charger_patterns(config_path)
+        PATTERNS = config.charger_patterns(config_path)
     except Exception as e:
         page.add(ft.Text(f"Erreur fatale à l'initialisation : {e}"))
         return
 
-    if not valider_cle_gemini.PATTERNS:
-        page.add(ft.Text("Erreur: Impossible de charger la configuration des secrets."))
+    if not PATTERNS:
+        page.add(ft.Text("Erreur: Impossible de charger la configuration des secrets depuis config.json."))
         return
 
-    def create_task_runner(target_func, controls_to_disable, progress_bar, result_log, status_text, pause_event, cancel_event, *args):
+    def create_task_runner(target_func, controls_to_manage, pause_button, cancel_button, pause_event, cancel_event, **kwargs):
         def task_wrapper():
-            progress_bar.visible = True
-            status_text.visible = True
-            for c in controls_to_disable:
-                c.disabled = True
+            # Active les contrôles de la tâche (barre de progression, boutons pause/annuler)
+            for control in controls_to_manage.values():
+                if isinstance(control, (ProgressBar, Text)):
+                    control.visible = True
+            pause_button.visible = True
+            cancel_button.visible = True
             page.update()
             
-            original_stdout = valider_cle_gemini.sys.stdout
-            valider_cle_gemini.sys.stdout = UILogger(result_log, progress_bar, page, status_text)
-            
             try:
-                target_func(*args, pause_event, cancel_event)
+                target_func(patterns=PATTERNS, pause_event=pause_event, cancel_event=cancel_event, **kwargs)
             finally:
-                valider_cle_gemini.sys.stdout = original_stdout
-                progress_bar.visible = False
-                status_text.visible = False
-                for c in controls_to_disable:
-                    c.disabled = False
-                    if isinstance(c, ft.ElevatedButton) and (c.text == "Pause" or c.text == "Annuler"):
-                        c.visible = False
-                page.update()
+                # Masque les contrôles de la tâche une fois terminée
+                if not cancel_event.is_set():
+                    for c in controls_to_manage['buttons_to_disable']:
+                        c.disabled = False
+                    for control in controls_to_manage.values():
+                        if isinstance(control, (ProgressBar, Text)):
+                            control.visible = False
+                    pause_button.visible = False
+                    cancel_button.visible = False
+                    page.update()
 
         return task_wrapper
 
+    # --- Définition des Callbacks pour l'UI ---
+    def ui_progress_callback(progress_bar: ProgressBar, status_text: Text, current: int, total: int, message: str):
+        if total > 0:
+            progress_bar.value = current / total
+        status_text.value = message
+        page.update()
+
+    def ui_result_callback(result_log: TextField, result: dict):
+        status = "VALIDE" if result.get('is_valid') else "INVALIDE"
+        color = ft.colors.GREEN if result.get('is_valid') else ft.colors.RED
+        
+        # Tronquer la clé pour la sécurité
+        key_display = f"{result['key'][:4]}...{result['key'][-4:]}" if len(result['key']) > 8 else result['key']
+        
+        log_entry = f"[{result['timestamp']}] {result['service']} - {status} - Clé: {key_display} (Source: {result['source_type']} @ {result['source_info']})\n"
+        
+        # Pour Flet, il est plus sûr de mettre à jour les contrôles de cette manière
+        result_log.value += log_entry
+        page.update()
+
     # --- Onglet Validation ---
     api_key_input = TextField(label="Clé API", width=450, password=True, can_reveal_password=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
-    service_dropdown = Dropdown(label="Service", options=[ft.dropdown.Option(key) for key in valider_cle_gemini.PATTERNS.keys()], width=200, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
+    service_dropdown = Dropdown(label="Service", options=[ft.dropdown.Option(key) for key in PATTERNS.keys()], width=200, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     validate_button = ElevatedButton(text="Valider", icon=ft.Icons.SECURITY, bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
     result_text = Text(size=16, weight=ft.FontWeight.BOLD)
 
@@ -105,7 +107,7 @@ def main(page: ft.Page):
             page.update()
             return
 
-        validator = valider_cle_gemini.PATTERNS[service]["validator"]
+        validator = PATTERNS[service]["validator"]
         is_valid = validator(key, silencieux=True)
         if is_valid:
             result_text.value = f"SUCCÈS : La clé pour {service} est VALIDE."
@@ -116,16 +118,81 @@ def main(page: ft.Page):
         page.update()
     validate_button.on_click = validate_key_click
 
+    # --- Fonctions génériques pour les tâches asynchrones ---
+    def start_task(e, task_config):
+        # Vérification des prérequis
+        if task_config['pre_check'] and not task_config['pre_check']():
+            # Affiche un message d'erreur dans le log correspondant
+            task_config['result_log'].value = f"[!] Erreur: {task_config.get('error_message', 'Veuillez vérifier les champs.')}"
+            page.update()
+            return
+        
+        # Réinitialisation des logs et événements
+        task_config['result_log'].value = f"[*] Démarrage de la tâche: {task_config['name']}\n"
+        task_config['pause_event'].set()
+        task_config['cancel_event'].clear()
+
+        # Désactivation des boutons
+        for btn in task_config['controls_to_disable']:
+            btn.disabled = True
+        
+        # Création des callbacks avec les contrôles UI spécifiques
+        progress_cb = partial(ui_progress_callback, task_config['progress_bar'], task_config['status_text'])
+        result_cb = partial(ui_result_callback, task_config['result_log'])
+        
+        # Préparation des arguments pour la fonction core
+        core_args = task_config['get_core_args']()
+        core_args['progress_callback'] = progress_cb
+        core_args['result_callback'] = result_cb
+
+        # Configuration du task runner
+        runner_controls = {
+            'buttons_to_disable': task_config['controls_to_disable'],
+            'progress_bar': task_config['progress_bar'],
+            'status_text': task_config['status_text']
+        }
+        
+        task = create_task_runner(
+            task_config['target_func'], 
+            runner_controls,
+            task_config['pause_button'], 
+            task_config['cancel_button'],
+            task_config['pause_event'], 
+            task_config['cancel_event'],
+            **core_args
+        )
+        threading.Thread(target=task, daemon=True).start()
+
+    def pause_task(e, pause_event, pause_button, status_text, task_name):
+        if pause_button.text == "Pause":
+            pause_event.clear()
+            pause_button.text = "Reprendre"
+            status_text.value = f"[*] {task_name} en pause..."
+        else:
+            pause_event.set()
+            pause_button.text = "Pause"
+            status_text.value = f"[*] Reprise de {task_name}..."
+        page.update()
+
+    def cancel_task(e, cancel_event, controls_to_disable, pause_button, cancel_button, status_text, task_name):
+        cancel_event.set()
+        status_text.value = f"[*] Annulation de {task_name}..."
+        for btn in controls_to_disable:
+            btn.disabled = False
+        pause_button.visible = False
+        cancel_button.visible = False
+        pause_button.text = "Pause"
+        page.update()
+
     # --- Onglet Scan de Fichiers ---
     scan_path_text = Text()
     scan_results_log = TextField(multiline=True, read_only=True, expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     pick_folder_button = ElevatedButton("Sélectionner un Répertoire", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
     start_scan_button = ElevatedButton("Lancer le Scan", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
-    pause_scan_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, disabled=True, visible=False)
-    cancel_scan_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, disabled=True, visible=False)
+    pause_scan_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, visible=False)
+    cancel_scan_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, visible=False)
     scan_progress = ProgressBar(visible=False, color=ft.Colors.LIGHT_BLUE_ACCENT_400, bgcolor=ft.Colors.BLUE_GREY_700)
     scan_status_text = Text("", visible=False)
-
     scan_pause_event = threading.Event()
     scan_cancel_event = threading.Event()
 
@@ -140,78 +207,74 @@ def main(page: ft.Page):
         file_picker.get_directory_path()
     pick_folder_button.on_click = pick_folder_action
 
-    def start_scan_click(e):
-        path = scan_path_text.value
-        if not path or not os.path.isdir(path):
-            scan_results_log.value = "Erreur: Veuillez sélectionner un répertoire valide."
-            page.update()
-            return
-        scan_results_log.value = f"[*] Démarrage du scan dans : {path}\n"
-        scan_pause_event.clear()
-        scan_cancel_event.clear()
-        start_scan_button.disabled = True
-        pick_folder_button.disabled = True
-        pause_scan_button.disabled = False
-        cancel_scan_button.disabled = False
-        pause_scan_button.visible = True
-        cancel_scan_button.visible = True
-        page.update()
-        task = create_task_runner(valider_cle_gemini.mode_scan, [start_scan_button, pick_folder_button, pause_scan_button, cancel_scan_button], scan_progress, scan_results_log, scan_status_text, scan_pause_event, scan_cancel_event, type('Args', (), {'path': path}))
-        threading.Thread(target=task, daemon=True).start()
-    start_scan_button.on_click = start_scan_click
+    scan_task_config = {
+        'name': "Scan de fichiers",
+        'target_func': core.mode_scan,
+        'result_log': scan_results_log,
+        'pause_event': scan_pause_event,
+        'cancel_event': scan_cancel_event,
+        'controls_to_disable': [start_scan_button, pick_folder_button],
+        'progress_bar': scan_progress,
+        'status_text': scan_status_text,
+        'pause_button': pause_scan_button,
+        'cancel_button': cancel_scan_button,
+        'pre_check': lambda: scan_path_text.value and os.path.isdir(scan_path_text.value),
+        'error_message': "Veuillez sélectionner un répertoire valide.",
+        'get_core_args': lambda: {'scan_path': scan_path_text.value}
+    }
+    start_scan_button.on_click = partial(start_task, task_config=scan_task_config)
+    pause_scan_button.on_click = partial(pause_task, pause_event=scan_pause_event, pause_button=pause_scan_button, status_text=scan_status_text, task_name="Scan de fichiers")
+    cancel_scan_button.on_click = partial(cancel_task, cancel_event=scan_cancel_event, controls_to_disable=scan_task_config['controls_to_disable'], pause_button=pause_scan_button, cancel_button=cancel_scan_button, status_text=scan_status_text, task_name="Scan de fichiers")
 
-    def pause_scan_click(e):
-        if pause_scan_button.text == "Pause":
-            scan_pause_event.set()
-            pause_scan_button.text = "Reprendre"
-            scan_status_text.value = "[*] Scan en pause..."
-        else:
-            scan_pause_event.clear()
-            pause_scan_button.text = "Pause"
-            scan_status_text.value = "[*] Reprise du scan..."
-        page.update()
-    pause_scan_button.on_click = pause_scan_click
-
-    def cancel_scan_click(e):
-        scan_cancel_event.set()
-        scan_status_text.value = "[*] Annulation du scan..."
-        start_scan_button.disabled = False
-        pick_folder_button.disabled = False
-        pause_scan_button.disabled = True
-        cancel_scan_button.disabled = True
-        pause_scan_button.text = "Pause"
-        page.update()
-    cancel_scan_button.on_click = cancel_scan_click
-
-    start_scan_button.on_click = start_scan_click
-
-    # --- Onglet Devinette ---
+    # --- Onglet Devinette (Brute-force) ---
     brute_force_key_input = TextField(label="Clé partielle", width=300, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
-    brute_force_service_dropdown = Dropdown(label="Service", options=[ft.dropdown.Option(key) for key in valider_cle_gemini.PATTERNS.keys()], width=200, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
+    brute_force_service_dropdown = Dropdown(label="Service", options=[ft.dropdown.Option(key) for key in PATTERNS.keys()], width=200, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     brute_force_depth_input = TextField(label="Profondeur", width=100, value="2", filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     brute_force_button = ElevatedButton("Lancer Brute-force", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
-    pause_brute_force_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, disabled=True, visible=False)
-    cancel_brute_force_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, disabled=True, visible=False)
+    pause_brute_force_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, visible=False)
+    cancel_brute_force_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, visible=False)
     brute_force_progress = ProgressBar(visible=False, color=ft.Colors.LIGHT_BLUE_ACCENT_400, bgcolor=ft.Colors.BLUE_GREY_700)
     brute_force_status_text = Text("", visible=False)
-
+    brute_force_result_log = TextField(multiline=True, read_only=True, expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     brute_force_pause_event = threading.Event()
     brute_force_cancel_event = threading.Event()
-    brute_force_result_log = TextField(multiline=True, read_only=True, expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
 
+    brute_force_task_config = {
+        'name': "Brute-force",
+        'target_func': core.mode_brute_force,
+        'result_log': brute_force_result_log,
+        'pause_event': brute_force_pause_event,
+        'cancel_event': brute_force_cancel_event,
+        'controls_to_disable': [brute_force_button, brute_force_key_input, brute_force_service_dropdown, brute_force_depth_input],
+        'progress_bar': brute_force_progress,
+        'status_text': brute_force_status_text,
+        'pause_button': pause_brute_force_button,
+        'cancel_button': cancel_brute_force_button,
+        'pre_check': lambda: brute_force_key_input.value and brute_force_service_dropdown.value,
+        'error_message': "Clé partielle et service requis.",
+        'get_core_args': lambda: {
+            'cle_partielle': brute_force_key_input.value,
+            'service_specifie': brute_force_service_dropdown.value,
+            'depth': int(brute_force_depth_input.value)
+        }
+    }
+    brute_force_button.on_click = partial(start_task, task_config=brute_force_task_config)
+    pause_brute_force_button.on_click = partial(pause_task, pause_event=brute_force_pause_event, pause_button=pause_brute_force_button, status_text=brute_force_status_text, task_name="Brute-force")
+    cancel_brute_force_button.on_click = partial(cancel_task, cancel_event=brute_force_cancel_event, controls_to_disable=brute_force_task_config['controls_to_disable'], pause_button=pause_brute_force_button, cancel_button=cancel_brute_force_button, status_text=brute_force_status_text, task_name="Brute-force")
+
+    # --- Onglet Devinette (Dictionnaire) ---
     dict_key_input = TextField(label="Clé partielle", width=300, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
-    dict_service_dropdown = Dropdown(label="Service", options=[ft.dropdown.Option(key) for key in valider_cle_gemini.PATTERNS.keys()], width=200, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
+    dict_service_dropdown = Dropdown(label="Service", options=[ft.dropdown.Option(key) for key in PATTERNS.keys()], width=200, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     dict_wordlist_path_text = Text()
     pick_wordlist_button = ElevatedButton("Sélectionner un dictionnaire", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
     dict_button = ElevatedButton("Lancer l'Attaque", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
-    pause_dict_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, disabled=True, visible=False)
-    cancel_dict_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, disabled=True, visible=False)
+    pause_dict_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, visible=False)
+    cancel_dict_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, visible=False)
     dict_progress = ProgressBar(visible=False, color=ft.Colors.LIGHT_BLUE_ACCENT_400, bgcolor=ft.Colors.BLUE_GREY_700)
     dict_status_text = Text("", visible=False)
-
+    dict_result_log = TextField(multiline=True, read_only=True, expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     dict_pause_event = threading.Event()
     dict_cancel_event = threading.Event()
-    dict_result_log = TextField(multiline=True, read_only=True, expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
 
     def pick_wordlist_action(e):
         def on_result(result: ft.FilePickerResultEvent):
@@ -224,111 +287,48 @@ def main(page: ft.Page):
         file_picker.pick_files()
     pick_wordlist_button.on_click = pick_wordlist_action
 
-    def start_brute_force_click(e):
-        key = brute_force_key_input.value
-        service = brute_force_service_dropdown.value
-        depth = int(brute_force_depth_input.value)
-        if not key or not service:
-            brute_force_result_log.value = "Erreur: Veuillez fournir une clé partielle et un service."
-            page.update()
-            return
-        brute_force_result_log.value = f"[*] Démarrage du brute-force pour {service}...\n"
-        brute_force_pause_event.clear()
-        brute_force_cancel_event.clear()
-        brute_force_button.disabled = True
-        pause_brute_force_button.disabled = False
-        cancel_brute_force_button.disabled = False
-        pause_brute_force_button.visible = True
-        cancel_brute_force_button.visible = True
-        page.update()
-        task = create_task_runner(valider_cle_gemini.mode_brute_force, [brute_force_button, pause_brute_force_button, cancel_brute_force_button], brute_force_progress, brute_force_result_log, brute_force_status_text, brute_force_pause_event, brute_force_cancel_event, type('Args', (), {'partial_key': key, 'type': service, 'depth': depth}))
-        threading.Thread(target=task, daemon=True).start()
-    brute_force_button.on_click = start_brute_force_click
-
-    def pause_brute_force_click(e):
-        if pause_brute_force_button.text == "Pause":
-            brute_force_pause_event.set()
-            pause_brute_force_button.text = "Reprendre"
-            brute_force_status_text.value = "[*] Brute-force en pause..."
-        else:
-            brute_force_pause_event.clear()
-            pause_brute_force_button.text = "Pause"
-            brute_force_status_text.value = "[*] Reprise du brute-force..."
-        page.update()
-    pause_brute_force_button.on_click = pause_brute_force_click
-
-    def cancel_brute_force_click(e):
-        brute_force_cancel_event.set()
-        brute_force_status_text.value = "[*] Annulation du brute-force..."
-        brute_force_button.disabled = False
-        pause_brute_force_button.disabled = True
-        cancel_brute_force_button.disabled = True
-        pause_brute_force_button.text = "Pause"
-        page.update()
-    cancel_brute_force_button.on_click = cancel_brute_force_click
-
-    def start_dict_attack_click(e):
-        key = dict_key_input.value
-        service = dict_service_dropdown.value
-        wordlist = dict_wordlist_path_text.value
-        if not key or not service or not wordlist:
-            dict_result_log.value = "Erreur: Veuillez fournir une clé partielle, un service et un dictionnaire."
-            page.update()
-            return
-        dict_result_log.value = f"[*] Démarrage de l'attaque par dictionnaire pour {service}...\n"
-        dict_pause_event.clear()
-        dict_cancel_event.clear()
-        dict_button.disabled = True
-        pick_wordlist_button.disabled = True
-        pause_dict_button.disabled = False
-        cancel_dict_button.disabled = False
-        pause_dict_button.visible = True
-        cancel_dict_button.visible = True
-        page.update()
-        task = create_task_runner(valider_cle_gemini.mode_dictionnaire, [dict_button, pick_wordlist_button, pause_dict_button, cancel_dict_button], dict_progress, dict_result_log, dict_status_text, dict_pause_event, dict_cancel_event, type('Args', (), {'partial_key': key, 'type': service, 'wordlist': wordlist}))
-        threading.Thread(target=task, daemon=True).start()
-    dict_button.on_click = start_dict_attack_click
-
-    def pause_dict_click(e):
-        if pause_dict_button.text == "Pause":
-            dict_pause_event.set()
-            pause_dict_button.text = "Reprendre"
-            dict_status_text.value = "[*] Attaque par dictionnaire en pause..."
-        else:
-            dict_pause_event.clear()
-            pause_dict_button.text = "Pause"
-            dict_status_text.value = "[*] Reprise de l'attaque par dictionnaire..."
-        page.update()
-    pause_dict_button.on_click = pause_dict_click
-
-    def cancel_dict_click(e):
-        dict_cancel_event.set()
-        dict_status_text.value = "[*] Annulation de l'attaque par dictionnaire..."
-        dict_button.disabled = False
-        pick_wordlist_button.disabled = False
-        pause_dict_button.disabled = True
-        cancel_dict_button.disabled = True
-        pause_dict_button.text = "Pause"
-        page.update()
-    cancel_dict_button.on_click = cancel_dict_click
+    dict_task_config = {
+        'name': "Attaque par dictionnaire",
+        'target_func': core.mode_dictionnaire,
+        'result_log': dict_result_log,
+        'pause_event': dict_pause_event,
+        'cancel_event': dict_cancel_event,
+        'controls_to_disable': [dict_button, dict_key_input, dict_service_dropdown, pick_wordlist_button],
+        'progress_bar': dict_progress,
+        'status_text': dict_status_text,
+        'pause_button': pause_dict_button,
+        'cancel_button': cancel_dict_button,
+        'pre_check': lambda: dict_key_input.value and dict_service_dropdown.value and dict_wordlist_path_text.value,
+        'error_message': "Clé, service et wordlist requis.",
+        'get_core_args': lambda: {
+            'cle_partielle': dict_key_input.value,
+            'service_specifie': dict_service_dropdown.value,
+            'wordlist_path': dict_wordlist_path_text.value
+        }
+    }
+    dict_button.on_click = partial(start_task, task_config=dict_task_config)
+    pause_dict_button.on_click = partial(pause_task, pause_event=dict_pause_event, pause_button=pause_dict_button, status_text=dict_status_text, task_name="Attaque Dictionnaire")
+    cancel_dict_button.on_click = partial(cancel_task, cancel_event=dict_cancel_event, controls_to_disable=dict_task_config['controls_to_disable'], pause_button=pause_dict_button, cancel_button=cancel_dict_button, status_text=dict_status_text, task_name="Attaque Dictionnaire")
 
     # --- Onglet Scan Git ---
     git_scan_path_text = Text()
+    git_remote_url_input = TextField(label="URL du dépôt distant (ex: https://github.com/user/repo.git)", expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     git_scan_results_log = TextField(multiline=True, read_only=True, expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
-    pick_git_folder_button = ElevatedButton("Sélectionner un Dépôt Git", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
-    start_git_scan_button = ElevatedButton("Lancer le Scan Git", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
-    pause_git_scan_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, disabled=True, visible=False)
-    cancel_git_scan_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, disabled=True, visible=False)
+    pick_git_folder_button = ElevatedButton("Sélectionner un Dépôt Local", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
+    start_local_git_scan_button = ElevatedButton("Lancer Scan Local", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
+    start_remote_git_scan_button = ElevatedButton("Lancer Scan Distant", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
+    pause_git_scan_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, visible=False)
+    cancel_git_scan_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, visible=False)
     git_scan_progress = ProgressBar(visible=False, color=ft.Colors.LIGHT_BLUE_ACCENT_400, bgcolor=ft.Colors.BLUE_GREY_700)
     git_scan_status_text = Text("", visible=False)
-
     git_scan_pause_event = threading.Event()
     git_scan_cancel_event = threading.Event()
 
     def pick_git_folder_action(e):
         def on_result(result: ft.FilePickerResultEvent):
             if result.path:
-                git_scan_path_text.value = result.path
+                git_scan_path_text.value = f"Dépôt local sélectionné : {result.path}"
+                git_scan_path_text.data = result.path
                 page.update()
         file_picker = ft.FilePicker(on_result=on_result)
         page.overlay.append(file_picker)
@@ -336,60 +336,53 @@ def main(page: ft.Page):
         file_picker.get_directory_path()
     pick_git_folder_button.on_click = pick_git_folder_action
 
-    def start_git_scan_click(e):
-        path = git_scan_path_text.value
-        if not path or not os.path.isdir(path):
-            git_scan_results_log.value = "Erreur: Veuillez sélectionner un dépôt Git valide."
-            page.update()
-            return
-        git_scan_results_log.value = f"[*] Démarrage du scan Git dans : {path}\n"
-        git_scan_pause_event.clear()
-        git_scan_cancel_event.clear()
-        start_git_scan_button.disabled = True
-        pick_git_folder_button.disabled = True
-        pause_git_scan_button.disabled = False
-        cancel_git_scan_button.disabled = False
-        pause_git_scan_button.visible = True
-        cancel_git_scan_button.visible = True
-        page.update()
-        task = create_task_runner(valider_cle_gemini.mode_scan_git, [start_git_scan_button, pick_git_folder_button, pause_git_scan_button, cancel_git_scan_button], git_scan_progress, git_scan_results_log, git_scan_status_text, git_scan_pause_event, git_scan_cancel_event, type('Args', (), {'path': path}))
-        threading.Thread(target=task, daemon=True).start()
-    start_git_scan_button.on_click = start_git_scan_click
+    git_local_task_config = {
+        'name': "Scan Git Local",
+        'target_func': core.mode_scan_git,
+        'result_log': git_scan_results_log,
+        'pause_event': git_scan_pause_event,
+        'cancel_event': git_scan_cancel_event,
+        'controls_to_disable': [start_local_git_scan_button, start_remote_git_scan_button, pick_git_folder_button, git_remote_url_input],
+        'progress_bar': git_scan_progress,
+        'status_text': git_scan_status_text,
+        'pause_button': pause_git_scan_button,
+        'cancel_button': cancel_git_scan_button,
+        'pre_check': lambda: git_scan_path_text.data and os.path.isdir(git_scan_path_text.data),
+        'error_message': "Veuillez sélectionner un dépôt local valide.",
+        'get_core_args': lambda: {'repo_path': git_scan_path_text.data}
+    }
+    start_local_git_scan_button.on_click = partial(start_task, task_config=git_local_task_config)
 
-    def pause_git_scan_click(e):
-        if pause_git_scan_button.text == "Pause":
-            git_scan_pause_event.set()
-            pause_git_scan_button.text = "Reprendre"
-            git_scan_status_text.value = "[*] Scan Git en pause..."
-        else:
-            git_scan_pause_event.clear()
-            pause_git_scan_button.text = "Pause"
-            git_scan_status_text.value = "[*] Reprise du scan Git..."
-        page.update()
-    pause_git_scan_button.on_click = pause_git_scan_click
-
-    def cancel_git_scan_click(e):
-        git_scan_cancel_event.set()
-        git_scan_status_text.value = "[*] Annulation du scan Git..."
-        start_git_scan_button.disabled = False
-        pick_git_folder_button.disabled = False
-        pause_git_scan_button.disabled = True
-        cancel_git_scan_button.disabled = True
-        pause_git_scan_button.text = "Pause"
-        page.update()
-    cancel_git_scan_button.on_click = cancel_git_scan_click
+    git_remote_task_config = {
+        'name': "Scan Git Distant",
+        'target_func': core.mode_scan_remote_git,
+        'result_log': git_scan_results_log,
+        'pause_event': git_scan_pause_event,
+        'cancel_event': git_scan_cancel_event,
+        'controls_to_disable': [start_local_git_scan_button, start_remote_git_scan_button, pick_git_folder_button, git_remote_url_input],
+        'progress_bar': git_scan_progress,
+        'status_text': git_scan_status_text,
+        'pause_button': pause_git_scan_button,
+        'cancel_button': cancel_git_scan_button,
+        'pre_check': lambda: git_remote_url_input.value,
+        'error_message': "Veuillez saisir une URL de dépôt distant.",
+        'get_core_args': lambda: {'repo_url': git_remote_url_input.value}
+    }
+    start_remote_git_scan_button.on_click = partial(start_task, task_config=git_remote_task_config)
+    
+    pause_git_scan_button.on_click = partial(pause_task, pause_event=git_scan_pause_event, pause_button=pause_git_scan_button, status_text=git_scan_status_text, task_name="Scan Git")
+    cancel_git_scan_button.on_click = partial(cancel_task, cancel_event=git_scan_cancel_event, controls_to_disable=git_local_task_config['controls_to_disable'], pause_button=pause_git_scan_button, cancel_button=cancel_git_scan_button, status_text=git_scan_status_text, task_name="Scan Git")
 
     # --- Onglet Scan par Entropie ---
     entropy_scan_path_text = Text()
     entropy_scan_results_log = TextField(multiline=True, read_only=True, expand=True, filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     entropy_threshold_input = TextField(label="Seuil", width=100, value="4.0", filled=True, bgcolor=ft.Colors.BLUE_GREY_700, border_color=ft.Colors.TRANSPARENT)
     pick_entropy_folder_button = ElevatedButton("Sélectionner un Répertoire", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
-    start_entropy_scan_button = ElevatedButton("Lancer le Scan par Entropie", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
-    pause_entropy_scan_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, disabled=True, visible=False)
-    cancel_entropy_scan_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, disabled=True, visible=False)
+    start_entropy_scan_button = ElevatedButton("Lancer le Scan", bgcolor=ft.Colors.BLUE_GREY_700, color=ft.Colors.WHITE)
+    pause_entropy_scan_button = ElevatedButton("Pause", icon=ft.Icons.PAUSE, bgcolor=ft.Colors.AMBER_700, color=ft.Colors.WHITE, visible=False)
+    cancel_entropy_scan_button = ElevatedButton("Annuler", icon=ft.Icons.CANCEL, bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE, visible=False)
     entropy_scan_progress = ProgressBar(visible=False, color=ft.Colors.LIGHT_BLUE_ACCENT_400, bgcolor=ft.Colors.BLUE_GREY_700)
     entropy_scan_status_text = Text("", visible=False)
-
     entropy_scan_pause_event = threading.Event()
     entropy_scan_cancel_event = threading.Event()
 
@@ -404,53 +397,27 @@ def main(page: ft.Page):
         file_picker.get_directory_path()
     pick_entropy_folder_button.on_click = pick_entropy_folder_action
 
-    def start_entropy_scan_click(e):
-        path = entropy_scan_path_text.value
-        threshold = float(entropy_threshold_input.value)
-        if not path or not os.path.isdir(path):
-            entropy_scan_results_log.value = "Erreur: Veuillez sélectionner un répertoire valide."
-            page.update()
-            return
-        entropy_scan_results_log.value = f"[*] Démarrage du scan par entropie dans : {path}\n"
-        entropy_scan_pause_event.clear()
-        entropy_scan_cancel_event.clear()
-        start_entropy_scan_button.disabled = True
-        pick_entropy_folder_button.disabled = False
-        pause_entropy_scan_button.disabled = False
-        cancel_entropy_scan_button.disabled = False
-        pause_entropy_scan_button.visible = True
-        cancel_entropy_scan_button.visible = True
-        page.update()
-        task = create_task_runner(valider_cle_gemini.mode_scan_entropy, [start_entropy_scan_button, pick_entropy_folder_button, pause_entropy_scan_button, cancel_entropy_scan_button], entropy_scan_progress, entropy_scan_results_log, entropy_scan_status_text, entropy_scan_pause_event, entropy_scan_cancel_event, type('Args', (), {'path': path, 'threshold': threshold}))
-        threading.Thread(target=task, daemon=True).start()
-    start_entropy_scan_button.on_click = start_entropy_scan_click
-
-    def pause_entropy_scan_click(e):
-        if pause_entropy_scan_button.text == "Pause":
-            entropy_scan_pause_event.set()
-            pause_entropy_scan_button.text = "Reprendre"
-            entropy_scan_status_text.value = "[*] Scan par entropie en pause..."
-        else:
-            entropy_scan_pause_event.clear()
-            pause_entropy_scan_button.text = "Pause"
-            entropy_scan_status_text.value = "[*] Reprise du scan par entropie..."
-        page.update()
-    pause_entropy_scan_button.on_click = pause_entropy_scan_click
-
-    def cancel_entropy_scan_click(e):
-        entropy_scan_cancel_event.set()
-        entropy_scan_status_text.value = "[*] Annulation du scan par entropie..."
-        start_entropy_scan_button.disabled = False
-        pick_entropy_folder_button.disabled = False
-        pause_entropy_scan_button.disabled = True
-        cancel_entropy_scan_button.disabled = True
-        pause_entropy_scan_button.text = "Pause"
-        page.update()
-    cancel_entropy_scan_button.on_click = cancel_entropy_scan_click
-
-    def build_tab_content():
-        # ... (Le code pour construire les autres onglets sera ajouté ici)
-        pass
+    entropy_task_config = {
+        'name': "Scan par Entropie",
+        'target_func': core.mode_scan_entropy,
+        'result_log': entropy_scan_results_log,
+        'pause_event': entropy_scan_pause_event,
+        'cancel_event': entropy_scan_cancel_event,
+        'controls_to_disable': [start_entropy_scan_button, pick_entropy_folder_button, entropy_threshold_input],
+        'progress_bar': entropy_scan_progress,
+        'status_text': entropy_scan_status_text,
+        'pause_button': pause_entropy_scan_button,
+        'cancel_button': cancel_entropy_scan_button,
+        'pre_check': lambda: entropy_scan_path_text.value and os.path.isdir(entropy_scan_path_text.value),
+        'error_message': "Veuillez sélectionner un répertoire valide.",
+        'get_core_args': lambda: {
+            'scan_path': entropy_scan_path_text.value,
+            'threshold': float(entropy_threshold_input.value)
+        }
+    }
+    start_entropy_scan_button.on_click = partial(start_task, task_config=entropy_task_config)
+    pause_entropy_scan_button.on_click = partial(pause_task, pause_event=entropy_scan_pause_event, pause_button=pause_entropy_scan_button, status_text=entropy_scan_status_text, task_name="Scan par Entropie")
+    cancel_entropy_scan_button.on_click = partial(cancel_task, cancel_event=entropy_scan_cancel_event, controls_to_disable=entropy_task_config['controls_to_disable'], pause_button=pause_entropy_scan_button, cancel_button=cancel_entropy_scan_button, status_text=entropy_scan_status_text, task_name="Scan par Entropie")
 
     page.add(
         Tabs(
@@ -495,7 +462,6 @@ def main(page: ft.Page):
                         expand=True
                     )
                 ),
-                # Les autres onglets seront ajoutés ici
                 Tab(
                     text="Devinette",
                     icon=ft.Icons.CASINO,
@@ -526,13 +492,19 @@ def main(page: ft.Page):
                 ),
                 Tab(
                     text="Scan Git",
-                    icon=ft.Icons.HISTORY,
+                    icon=ft.Icons.TRAVEL_EXPLORE,
                     content=Container(
                         content=Card(
                             content=Container(
                                 content=Column([
-                                    Row([pick_git_folder_button, start_git_scan_button, pause_git_scan_button, cancel_git_scan_button], alignment=ft.MainAxisAlignment.CENTER),
+                                    Text("Scan de Dépôt Local", weight=FontWeight.BOLD),
+                                    Row([pick_git_folder_button, start_local_git_scan_button], alignment=MainAxisAlignment.START),
                                     git_scan_path_text,
+                                    ft.Divider(),
+                                    Text("Scan de Dépôt Distant", weight=FontWeight.BOLD),
+                                    Row([git_remote_url_input, start_remote_git_scan_button], alignment=MainAxisAlignment.START),
+                                    ft.Divider(),
+                                    Row([pause_git_scan_button, cancel_git_scan_button], alignment=MainAxisAlignment.CENTER),
                                     git_scan_progress,
                                     git_scan_status_text,
                                     git_scan_results_log
@@ -610,3 +582,4 @@ def main(page: ft.Page):
 
 if __name__ == "__main__":
     ft.app(target=main)
+
