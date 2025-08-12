@@ -18,6 +18,8 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Optional
+import random
 from typing import Callable
 
 try:
@@ -82,6 +84,74 @@ def calculate_entropy(s: str) -> float:
         entropy -= freq * math.log2(freq)
     return entropy
 
+def generate_random_string(length: int, chars: str = CHARSET) -> str:
+    """Génère une chaîne de caractères aléatoires d'une longueur donnée."""
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def generate_key(service: str) -> str:
+    """Génère une clé API basée sur le format du service."""
+    if service == "OpenAI":
+        # Format: sk-[20 chars]T3BlbkFJ[20 chars] (total 48 chars après sk-)
+        return f"sk-{generate_random_string(20)}T3BlbkFJ{generate_random_string(20)}"
+    elif service == "Gemini":
+        # Format générique: 30-100 caractères alphanumériques, tirets, underscores
+        length = random.randint(30, 100)
+        return generate_random_string(length)
+    # Ajoutez d'autres services si nécessaire
+    return ""
+
+def tester_cle_openai(api_key: str) -> Optional[str]:
+    """Teste une clé OpenAI en effectuant un appel à l'API."""
+    import requests
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        r = requests.get("https://api.openai.com/v1/models", headers=headers, timeout=15)
+        if r.status_code == 200:   
+            return "Clé OpenAI VALIDE"
+        elif r.status_code == 401:
+            return "Clé OpenAI INVALIDE ou non autorisée"
+        elif r.status_code == 429:
+            return "Limite de requêtes OpenAI atteinte"
+        else:
+            return f"Erreur OpenAI: {r.status_code} - {r.text}"
+    except requests.exceptions.RequestException as e:
+        return f"Erreur lors de l'appel OpenAI: {e}"
+
+
+
+
+
+def tester_cle_gemini(api_key):
+    """Teste une clé Gemini en effectuant un appel HTTP direct à l'API Gemini."""
+    import requests
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": "Explain how AI works in a few words"}
+                ]
+            }
+        ]
+    }
+    try:
+        r = requests.post(url, headers=headers, json=data, timeout=15)
+        if r.status_code == 200 and "candidates" in r.json():
+            return "Clé Gemini VALIDE"
+        elif r.status_code == 401:
+            return "Clé Gemini INVALIDE ou non autorisée"
+        elif r.status_code == 429:
+            return "Limite de requêtes Gemini atteinte"
+        else:
+            return f"Erreur Gemini: {r.status_code} - {r.text}"
+    except requests.exceptions.RequestException as e:
+        return f"Erreur lors de l'appel Gemini: {e}"
+
+       
+
+
 # --- MODES DE SCAN ---
 
 def mode_validation(patterns: dict, api_key: str = None, service_specifie: str = None, result_callback=None):
@@ -115,6 +185,31 @@ def mode_validation(patterns: dict, api_key: str = None, service_specifie: str =
                 break
         if not cle_valide_trouvee:
             rapport("Unknown", key_to_test, False)
+
+def mode_find_keys(patterns: dict, service_specifie: str, num_keys_to_generate: int, pause_event: threading.Event, cancel_event: threading.Event, progress_callback=None, result_callback=None):
+    if service_specifie not in patterns:
+        print(f"[!] Erreur : service '{service_specifie}' non supporté.")
+        return
+
+    validator = patterns[service_specifie]["validator"]
+    if not progress_callback: print(f"[*] Génération et validation de {num_keys_to_generate} clés pour {service_specifie}...")
+
+    keys_generated = 0
+    for i in range(num_keys_to_generate):
+        if cancel_event.is_set(): return
+        pause_event.wait()
+
+        key_candidate = generate_key(service_specifie)
+        keys_generated += 1
+
+        if progress_callback:
+            progress_callback(keys_generated, num_keys_to_generate, f"Génération: {key_candidate[:10]}...")
+        else:
+            sys.stdout.write(f"\r[*] Génération {keys_generated}/{num_keys_to_generate} : {key_candidate[:10]}...")
+            sys.stdout.flush()
+
+        if validator(key_candidate, silencieux=True):
+            valider_et_rapporter(validator, service_specifie, key_candidate, "generated", f"Generated key for {service_specifie}", result_callback)
 
 def mode_brute_force(patterns: dict, cle_partielle: str, service_specifie: str, depth: int, pause_event: threading.Event, cancel_event: threading.Event, progress_callback=None, result_callback=None):
     if service_specifie not in patterns:
@@ -317,4 +412,3 @@ def enregistrer_resultats(output_file, output_format):
         print("[+] Enregistrement terminé.")
     except IOError as e:
         print(f"[!] Erreur lors de l'écriture du fichier de résultats : {e}")
-

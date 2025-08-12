@@ -4,24 +4,47 @@ Module contenant les fonctions de validation spécifiques pour chaque service AP
 """
 import time
 import requests
+import re
 
 # --- CONSTANTES ---
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 GITHUB_API_URL = "https://api.github.com/user"
 
 # --- FONCTIONS DE VALIDATION SPÉCIFIQUES ---
+
+def validate_regex(key: str, pattern: str, silencieux: bool = False) -> bool:
+    """Valide une clé en utilisant une expression régulière."""
+    if not silencieux:
+        print(f"[*] Validation regex pour la clé : {key[:4]}...{key[-4:]}")
+    return re.fullmatch(pattern, key) is not None
 
 def tester_cle_api_gemini(api_key: str, silencieux: bool = False) -> bool:
     """Teste une clé API Google Gemini."""
     if not silencieux:
         print(f"[*] Test de la clé (Google) : {api_key[:4]}...{api_key[-4:]}")
-    headers = {'Content-Type': 'application/json'}
-    payload = {"contents": [{"parts": [{"text": "test"}]}]}
-    url_with_key = f"{GEMINI_API_URL}?key={api_key}"
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'X-goog-api-key': api_key
+    }
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": "test"
+                    }
+                ]
+            }
+        ]
+    }
+    
     try:
         # Une petite pause pour éviter de surcharger les services
         time.sleep(0.1)
-        response = requests.post(url_with_key, headers=headers, json=payload, timeout=10)
+        response = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=10)
+        
         if response.status_code == 200:
             return True
         elif response.status_code == 429:
@@ -30,6 +53,17 @@ def tester_cle_api_gemini(api_key: str, silencieux: bool = False) -> bool:
             time.sleep(60)
             # Nouvelle tentative après la pause
             return tester_cle_api_gemini(api_key, silencieux)
+        elif response.status_code == 400:
+            # Vérifier si c'est une erreur de clé invalide
+            try:
+                error_data = response.json()
+                if "error" in error_data and "details" in error_data["error"]:
+                    for detail in error_data["error"]["details"]:
+                        if detail.get("reason") == "API_KEY_INVALID":
+                            return False
+            except:
+                pass
+            return False
         return False
     except requests.exceptions.RequestException:
         return False
